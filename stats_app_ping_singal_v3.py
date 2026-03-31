@@ -4,6 +4,8 @@ from datetime import datetime
 import numpy as np
 from matplotlib.ticker import MaxNLocator
 import matplotlib.dates as mdates
+from pathlib import Path
+import sys
 
 
 def check_int(s):
@@ -25,9 +27,22 @@ devices_id = set(())
 curr_device = 0
 
 filename = "week10_26"
-charts_folder = f"5G-Seagul_data/plots_last_test/{filename}"
-# charts_folder = f"5G-Seagul_data/plots_last_test/test"
-with open(f"5G-Seagul_data/{filename}.csv", newline="") as csvfile:
+if len(sys.argv) > 1:
+    filename = sys.argv[1]
+
+csv_candidates = [
+    Path(f"{filename}.csv"),
+    Path("5G-Seagul_data") / f"{filename}.csv",
+]
+input_csv = next((path for path in csv_candidates if path.exists()), None)
+charts_folder = Path("graphs") / filename
+charts_folder.mkdir(parents=True, exist_ok=True)
+
+if input_csv is None:
+    candidate_list = ", ".join(str(path) for path in csv_candidates)
+    raise FileNotFoundError(f"CSV file not found. Checked: {candidate_list}")
+
+with input_csv.open(newline="") as csvfile:
     spamreader = csv.reader(csvfile, delimiter=",", quotechar='"')
     for row in spamreader:
         data.append(row)
@@ -218,7 +233,7 @@ for curr_device in range(len(devices_id)):
 
             plt.suptitle(f"Session")
             suffix = "1" if transition_type == "Off → On" else "2"
-            output_file = f"{charts_folder}/{fila_date}_singal_{devices_id[curr_device]}_{suffix}.png"
+            output_file = charts_folder / f"{fila_date}_singal_{devices_id[curr_device]}_{suffix}.png"
             plt.savefig(output_file, dpi=300, bbox_inches="tight")
             print(f"Figure saved as {output_file}")
             plt.close()
