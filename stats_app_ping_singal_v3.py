@@ -24,6 +24,7 @@ DEFAULT_MODE = "hybrid"
 DEFAULT_GAP_SECONDS = 5
 DEFAULT_INTERP_LIMIT = 2
 MIN_POINTS = 5
+MAX_INTERP_GAP = 2
 DEFAULT_FILENAME = "week10_26"
 
 ## PARSING ARGUMENTS
@@ -249,21 +250,45 @@ for curr_device in range(len(devices_id)):
                             continue
 
                         if mode == "hybrid":
-                            internal_gaps = (
-                                raw_valid.index.to_series().diff().dt.total_seconds().dropna()
+                            sub_gap = (
+                                raw_valid.index.to_series().diff().dt.total_seconds().fillna(0)
                             )
-                            has_large_internal_gap = (internal_gaps > GAP_SECONDS).any()
-                            if has_large_internal_gap:
-                                # Keep raw values only; skip interpolation for unstable segments.
-                                seg_processed = raw_valid
-                            else:
-                                full_idx = pd.date_range(seg.index.min(), seg.index.max(), freq="1s")
-                                seg_full = seg.reindex(full_idx)
-                                seg_processed = seg_full.interpolate(
-                                    method="time",
-                                    limit=INTERP_LIMIT if INTERP_LIMIT > 0 else None,
-                                    limit_area="inside",
+                            sub_segment_id = (sub_gap > MAX_INTERP_GAP).cumsum()
+                            for _, sub_seg in raw_valid.groupby(sub_segment_id):
+                                if len(sub_seg) < MIN_POINTS:
+                                    continue
+
+                                sub_internal_gaps = (
+                                    sub_seg.index.to_series().diff().dt.total_seconds().dropna()
                                 )
+                                is_dense = (
+                                    sub_internal_gaps.le(MAX_INTERP_GAP).all()
+                                    if not sub_internal_gaps.empty
+                                    else True
+                                )
+
+                                if is_dense:
+                                    full_idx = pd.date_range(
+                                        sub_seg.index.min(), sub_seg.index.max(), freq="1s"
+                                    )
+                                    sub_full = sub_seg.reindex(full_idx)
+                                    sub_processed = sub_full.interpolate(
+                                        method="time",
+                                        limit=INTERP_LIMIT if INTERP_LIMIT > 0 else None,
+                                        limit_area="inside",
+                                    )
+                                else:
+                                    sub_processed = sub_seg
+
+                                sub_valid = sub_processed.dropna()
+                                if len(sub_valid) < MIN_POINTS:
+                                    continue
+
+                                segments.append(
+                                    (sub_valid.index.to_pydatetime(), sub_valid.values)
+                                )
+                                combined_values.append(sub_valid.values)
+                            continue
                         else:
                             seg_processed = raw_valid
 
