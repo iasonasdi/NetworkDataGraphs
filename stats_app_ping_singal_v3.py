@@ -2,10 +2,12 @@ import csv
 import matplotlib.pyplot as plt
 from datetime import datetime
 import numpy as np
+import pandas as pd
 from matplotlib.ticker import MaxNLocator
 import matplotlib.dates as mdates
 from pathlib import Path
 import sys
+import argparse
 
 
 def check_int(s):
@@ -17,6 +19,54 @@ def check_int(s):
     return s.isdigit()
 
 
+## GLOBAL DEFAULTS (edit these as needed)
+DEFAULT_MODE = "hybrid"
+DEFAULT_GAP_SECONDS = 5
+DEFAULT_INTERP_LIMIT = 2
+DEFAULT_FILENAME = "week10_26_hybrid"
+
+## PARSING ARGUMENTS
+parser = argparse.ArgumentParser(description="Signal analysis with gap handling")
+
+parser.add_argument(
+    "--mode",
+    choices=["cut", "interpolate", "hybrid"],
+    default=DEFAULT_MODE,
+    help="Handling missing data: cut gaps, interpolate, or hybrid"
+)
+
+parser.add_argument(
+    "--gap",
+    type=int,
+    default=DEFAULT_GAP_SECONDS,
+    help="Gap threshold in seconds (used for cut/hybrid)"
+)
+
+parser.add_argument(
+    "--interp_limit",
+    type=int,
+    default=DEFAULT_INTERP_LIMIT,
+    help="Max consecutive missing points to interpolate (hybrid mode)"
+)
+
+parser.add_argument(
+    "--filename",
+    type=str,
+    default=DEFAULT_FILENAME,
+    help="Input CSV base filename (without .csv extension)"
+)
+
+args = parser.parse_args()
+
+# Global config
+MODE = args.mode
+GAP_SECONDS = args.gap
+INTERP_LIMIT = args.interp_limit
+filename = args.filename
+
+
+
+
 # Step 1: Read the CSV and identify column positions
 data = []
 rsrp_pos = rsrq_pos = rssnr_pos = ssRsrp_pos = ssRsrq_pos = ssSinr_pos = 0
@@ -25,10 +75,6 @@ radiotype_pos = 0
 
 devices_id = set(())
 curr_device = 0
-
-filename = "week10_26"
-if len(sys.argv) > 1:
-    filename = sys.argv[1]
 
 csv_candidates = [
     Path(f"{filename}.csv"),
@@ -123,9 +169,6 @@ for curr_device in range(len(devices_id)):
             session_data.append(car_data[start_idx:end_idx])
 
         for idx, session_entries in enumerate(session_data):
-            x_time, x_time1 = [], []
-            y_rsrp, y_rsrq, y_rssnr, y_ping = [], [], [], []
-
             fila_date = datetime.strptime(
                 car_data[sessions[idx]["start"]][time_pos], "%Y-%m-%d %H:%M:%S"
             ).strftime("%d_%m_%Y_%H_%M_%S")
@@ -138,31 +181,101 @@ for curr_device in range(len(devices_id)):
             dt = None
             network_changes = []  # Store (start_time, end_time, network_type)
 
+            # Build DataFrame with datetime index and numeric metrics
+            records = []
             for entry in session_entries:
-                if (
-                    check_int(entry[rsrp_pos])
-                    and check_int(entry[rsrq_pos])
-                    and check_int(entry[rssnr_pos])
-                    and check_int(entry[ping_pos])
-                    and entry[lpn_pos] == devices_id[curr_device]):
-                    dt = datetime.strptime(entry[time_pos], "%Y-%m-%d %H:%M:%S")
-                    x_time.append(dt)
-                    y_rsrp.append(int(entry[rsrp_pos]))
-                    y_rsrq.append(int(entry[rsrq_pos]))
-                    y_rssnr.append(int(entry[rssnr_pos]))
-
-                if (check_int(entry[ping_pos])
-                    and entry[lpn_pos] == devices_id[curr_device]):
-                    dt = datetime.strptime(entry[time_pos], "%Y-%m-%d %H:%M:%S")
-                    x_time1.append(dt)
-                    y_ping.append(int(entry[ping_pos]))
-
-                # Get network type from CSV
-                network_type = entry[radiotype_pos].strip().upper()  # e.g., "NR", "LTE"
-
-                # Detect changes in network type (only after dt has been set)
-                if dt is None:
+                if entry[lpn_pos] != devices_id[curr_device]:
                     continue
+                records.append(
+                    {
+                        "time": entry[time_pos],
+                        "rsrp": entry[rsrp_pos],
+                        "rsrq": entry[rsrq_pos],
+                        "rssnr": entry[rssnr_pos],
+                        "ping": entry[ping_pos],
+                        "radiotype": entry[radiotype_pos].strip().upper(),
+                    }
+                )
+
+            if not records:
+                print(f"Skipping session {idx + 1} ({transition_type}): no valid data in window")
+                plt.close()
+                continue
+
+            df = pd.DataFrame(records)
+            df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+            df = df.dropna(subset=["time"]).sort_values("time").set_index("time")
+            for metric in ["rsrp", "rsrq", "rssnr", "ping"]:
+                df[metric] = pd.to_numeric(df[metric], errors="coerce")
+
+            if df.empty or df["ping"].dropna().empty:
+                print(f"Skipping session {idx + 1} ({transition_type}): no valid data in window")
+                plt.close()
+                continue
+
+            def prepare_segments(metric):
+                series = df[metric]
+                if series.empty:
+                    return [], np.array([])
+
+                segments = []
+                combined_values = []
+                mode = MODE.lower()
+
+                if mode == "interpolate":
+                    # Single continuous segment, interpolate missing points across timeline.
+                    full_idx = pd.date_range(series.index.min(), series.index.max(), freq="1s")
+                    seg_full = series.reindex(full_idx)
+                    seg_processed = seg_full.interpolate(
+                        method="time",
+                        limit=INTERP_LIMIT if INTERP_LIMIT > 0 else None,
+                        limit_area="inside",
+                    )
+                    if seg_processed.notna().any():
+                        segments.append((seg_processed.index.to_pydatetime(), seg_processed.values))
+                        combined_values.append(seg_processed.dropna().values)
+                else:
+                    # "cut" and "hybrid" both split on large gaps.
+                    index_diff_sec = df.index.to_series().diff().dt.total_seconds().fillna(0)
+                    segment_id = (index_diff_sec > GAP_SECONDS).cumsum()
+                    for _, seg_df in df.groupby(segment_id):
+                        seg = seg_df[metric]
+                        if seg.empty:
+                            continue
+
+                        if mode == "hybrid":
+                            # Interpolate only small, internal gaps inside each valid segment.
+                            full_idx = pd.date_range(seg.index.min(), seg.index.max(), freq="1s")
+                            seg_full = seg.reindex(full_idx)
+                            seg_processed = seg_full.interpolate(
+                                method="time",
+                                limit=INTERP_LIMIT if INTERP_LIMIT > 0 else None,
+                                limit_area="inside",
+                            )
+                        else:
+                            # "cut": no interpolation, keep only original samples.
+                            seg_processed = seg
+
+                        if seg_processed.empty or not seg_processed.notna().any():
+                            continue
+
+                        segments.append((seg_processed.index.to_pydatetime(), seg_processed.values))
+                        combined_values.append(seg_processed.dropna().values)
+
+                if not combined_values:
+                    return segments, np.array([])
+                return segments, np.concatenate(combined_values)
+
+            rsrp_segments, y_rsrp = prepare_segments("rsrp")
+            rsrq_segments, y_rsrq = prepare_segments("rsrq")
+            rssnr_segments, y_rssnr = prepare_segments("rssnr")
+            ping_segments, y_ping = prepare_segments("ping")
+
+            # Detect network type transitions on valid, sorted timestamps
+            network_df = df[["radiotype"]].dropna()
+            for ts, row in network_df.iterrows():
+                dt = ts.to_pydatetime()
+                network_type = row["radiotype"]
                 if prev_network is None:
                     prev_network = network_type
                     segment_start = dt
@@ -171,18 +284,15 @@ for curr_device in range(len(devices_id)):
                     segment_start = dt
                     prev_network = network_type
 
-            if not y_ping:
-                print(f"Skipping session {idx + 1} ({transition_type}): no valid data in window")
-                plt.close()
-                continue
-
             # Add last segment
-            if segment_start is not None and prev_network is not None:
-                network_changes.append((segment_start, x_time[-1], prev_network))
+            if segment_start is not None and prev_network is not None and not df.empty:
+                network_changes.append((segment_start, df.index[-1].to_pydatetime(), prev_network))
 
             # Create subplots
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
-            below_50_percentage = (np.sum(np.array(y_ping) < 100) / len(y_ping)) * 100
+            below_50_percentage = (
+                (np.sum(np.array(y_ping) < 100) / len(y_ping)) * 100 if len(y_ping) > 0 else None
+            )
 
             ax1.grid(True, linestyle="--", alpha=0.5)
             ax2.grid(True, linestyle="--", alpha=0.5)
@@ -196,11 +306,17 @@ for curr_device in range(len(devices_id)):
             ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
 
             # Plot stats and metrics
+            def safe_stats(arr, name):
+                if len(arr) == 0:
+                    return f"{name}: No data"
+                return f"{name} Min: {np.min(arr)}, Max: {np.max(arr)}, Mean: {np.mean(arr):.2f}"
+
             stats_text = {
-                'rsrp': f"RSRP Min: {min(y_rsrp)}, Max: {max(y_rsrp)}, Mean: {np.mean(y_rsrp):.2f}",
-                'rsrq': f"RSRQ Min: {min(y_rsrq)}, Max: {max(y_rsrq)}, Mean: {np.mean(y_rsrq):.2f}",
-                'rssnr': f"RSSNR Min: {min(y_rssnr)}, Max: {max(y_rssnr)}, Mean: {np.mean(y_rssnr):.2f}",
-                'ping': f"Ping Min: {min(y_ping)}, Max: {max(y_ping)}, Mean: {np.mean(y_ping):.2f}, <100ms:{below_50_percentage:.2f}%"
+                "rsrp": safe_stats(y_rsrp, "RSRP"),
+                "rsrq": safe_stats(y_rsrq, "RSRQ"),
+                "rssnr": safe_stats(y_rssnr, "RSSNR"),
+                "ping": safe_stats(y_ping, "Ping")
+                + (f", <100ms:{below_50_percentage:.2f}%" if below_50_percentage is not None else ""),
             }
 
             ax1.text(0.01, 1 + (0.05 * 1), stats_text['rsrp'], transform=ax1.transAxes, fontsize=10, color='blue', verticalalignment="bottom")
@@ -208,9 +324,12 @@ for curr_device in range(len(devices_id)):
             ax1.text(0.01, 1 + (0.05 * 3), stats_text['rssnr'], transform=ax1.transAxes, fontsize=10, color='black', verticalalignment="bottom")
 
             # Plot RSRP, RSRQ, RSSNR
-            ax1.plot(x_time, y_rsrp, label="RSRP", color="blue")
-            ax1.plot(x_time, y_rsrq, label="RSRQ", color="red")
-            ax1.plot(x_time, y_rssnr, label="RSSNR", color="black")
+            for i_seg, (x_seg, y_seg) in enumerate(rsrp_segments):
+                ax1.plot(x_seg, y_seg, label="RSRP" if i_seg == 0 else "_nolegend_", color="blue")
+            for i_seg, (x_seg, y_seg) in enumerate(rsrq_segments):
+                ax1.plot(x_seg, y_seg, label="RSRQ" if i_seg == 0 else "_nolegend_", color="red")
+            for i_seg, (x_seg, y_seg) in enumerate(rssnr_segments):
+                ax1.plot(x_seg, y_seg, label="RSSNR" if i_seg == 0 else "_nolegend_", color="black")
             ax1.axvline(x=start_transition, color=line_color, linestyle="--",
                        label=f"Roaming: {transition_type}", alpha=0.7)
             ax1.set_title("RSRP, RSRQ, RSSNR Metrics")
@@ -223,7 +342,8 @@ for curr_device in range(len(devices_id)):
             ax2.text(0.01, 1, stats_text['ping'], transform=ax2.transAxes, fontsize=10, color="green", verticalalignment="bottom")
 
             # Plot Ping
-            ax2.plot(x_time1, y_ping, label="Ping", color="green")
+            for i_seg, (x_seg, y_seg) in enumerate(ping_segments):
+                ax2.plot(x_seg, y_seg, label="Ping" if i_seg == 0 else "_nolegend_", color="green")
             ax2.axvline(x=start_transition, color=line_color, linestyle="--",
                        label=transition_type.replace("Roaming: ", ""), alpha=0.7)
             ax2.set_title("Ping Metric")
