@@ -23,7 +23,8 @@ def check_int(s):
 DEFAULT_MODE = "hybrid"
 DEFAULT_GAP_SECONDS = 5
 DEFAULT_INTERP_LIMIT = 2
-DEFAULT_FILENAME = "week10_26_hybrid"
+MIN_POINTS = 5
+DEFAULT_FILENAME = "week10_26"
 
 ## PARSING ARGUMENTS
 parser = argparse.ArgumentParser(description="Signal analysis with gap handling")
@@ -218,52 +219,63 @@ for curr_device in range(len(devices_id)):
                 if series.empty:
                     return [], np.array([])
 
+                # Reindex/interpolation requires unique datetime labels.
+                if not series.index.is_unique:
+                    series = series.groupby(level=0).mean()
+
+                time_diff = series.index.to_series().diff().dt.total_seconds().fillna(0)
+                segment_id = (time_diff > GAP_SECONDS).cumsum()
                 segments = []
                 combined_values = []
                 mode = MODE.lower()
 
                 if mode == "interpolate":
-                    # Single continuous segment, interpolate missing points across timeline.
+                    raw_valid = series.dropna()
+                    if len(raw_valid) < MIN_POINTS:
+                        return [], np.array([])
                     full_idx = pd.date_range(series.index.min(), series.index.max(), freq="1s")
                     seg_full = series.reindex(full_idx)
-                    seg_processed = seg_full.interpolate(
-                        method="time",
-                        limit=INTERP_LIMIT if INTERP_LIMIT > 0 else None,
-                        limit_area="inside",
-                    )
-                    if seg_processed.notna().any():
-                        segments.append((seg_processed.index.to_pydatetime(), seg_processed.values))
-                        combined_values.append(seg_processed.dropna().values)
+                    seg_processed = seg_full.interpolate(method="time")
+                    seg_valid = seg_processed.dropna()
+                    if len(seg_valid) >= MIN_POINTS:
+                        segments.append((seg_valid.index.to_pydatetime(), seg_valid.values))
+                        combined_values.append(seg_valid.values)
                 else:
-                    # "cut" and "hybrid" both split on large gaps.
-                    index_diff_sec = df.index.to_series().diff().dt.total_seconds().fillna(0)
-                    segment_id = (index_diff_sec > GAP_SECONDS).cumsum()
-                    for _, seg_df in df.groupby(segment_id):
-                        seg = seg_df[metric]
+                    for _, seg in series.groupby(segment_id):
                         if seg.empty:
+                            continue
+                        raw_valid = seg.dropna()
+                        if len(raw_valid) < MIN_POINTS:
                             continue
 
                         if mode == "hybrid":
-                            # Interpolate only small, internal gaps inside each valid segment.
-                            full_idx = pd.date_range(seg.index.min(), seg.index.max(), freq="1s")
-                            seg_full = seg.reindex(full_idx)
-                            seg_processed = seg_full.interpolate(
-                                method="time",
-                                limit=INTERP_LIMIT if INTERP_LIMIT > 0 else None,
-                                limit_area="inside",
+                            internal_gaps = (
+                                raw_valid.index.to_series().diff().dt.total_seconds().dropna()
                             )
+                            has_large_internal_gap = (internal_gaps > GAP_SECONDS).any()
+                            if has_large_internal_gap:
+                                # Keep raw values only; skip interpolation for unstable segments.
+                                seg_processed = raw_valid
+                            else:
+                                full_idx = pd.date_range(seg.index.min(), seg.index.max(), freq="1s")
+                                seg_full = seg.reindex(full_idx)
+                                seg_processed = seg_full.interpolate(
+                                    method="time",
+                                    limit=INTERP_LIMIT if INTERP_LIMIT > 0 else None,
+                                    limit_area="inside",
+                                )
                         else:
-                            # "cut": no interpolation, keep only original samples.
-                            seg_processed = seg
+                            seg_processed = raw_valid
 
-                        if seg_processed.empty or not seg_processed.notna().any():
+                        seg_valid = seg_processed.dropna()
+                        if len(seg_valid) < MIN_POINTS:
                             continue
 
-                        segments.append((seg_processed.index.to_pydatetime(), seg_processed.values))
-                        combined_values.append(seg_processed.dropna().values)
+                        segments.append((seg_valid.index.to_pydatetime(), seg_valid.values))
+                        combined_values.append(seg_valid.values)
 
                 if not combined_values:
-                    return segments, np.array([])
+                    return [], np.array([])
                 return segments, np.concatenate(combined_values)
 
             rsrp_segments, y_rsrp = prepare_segments("rsrp")
